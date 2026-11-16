@@ -43,4 +43,5 @@ class NaturkaTrain(Base):
         "NaturkaVagon",
         back_populates="train",
         cascade="all, delete-orphan",
-    ) 
+        order_by="NaturkaVagon.order_number",
+    )

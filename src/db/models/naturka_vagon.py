@@ -10,6 +10,7 @@ from src.db.base import Base
 
 if TYPE_CHECKING:
     from src.db.models.naturka_train import NaturkaTrain
+    from src.db.models.railway import Railway
 
 
 class NaturkaVagon(Base):
@@ -17,6 +18,8 @@ class NaturkaVagon(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
 
+    # Ordinal number of the vagon in the naturka report (01, 02, ...).
+    order_number: Mapped[int] = mapped_column(Integer, nullable=False)
     vagon_number: Mapped[int] = mapped_column(Integer, nullable=False)
     vagoon_country: Mapped[int] = mapped_column(Integer, nullable=False)
     product_weight: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -49,5 +52,19 @@ class NaturkaVagon(Base):
 
     train: Mapped["NaturkaTrain"] = relationship(
         "NaturkaTrain",
+        back_populates="vagons",
+    )
+
+    # Where the vagon stands right now (None = not in the yard).
+    railway_id: Mapped[int | None] = mapped_column(
+        ForeignKey("railway.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # Order of the vagon on its current railway, counted from the entrance side.
+    position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    railway: Mapped["Railway | None"] = relationship(
+        "Railway",
         back_populates="vagons",
     )
