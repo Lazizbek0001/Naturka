@@ -1,538 +1,409 @@
-
+from __future__ import annotations
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
+from src.db.models import Railway, RailwayType, NaturkaCollection, NaturkaVagon, MessageIdCounter
+from src.schemas.railway import ReportImport, MoveToSorting, RangeExtract, SendDeparture, ReorderWagons, MoveWagonPosition, InsertExistingWagons
 
-from src.db.models.railway import Railway, RailwayType
-from src.db.models.naturka_collection import NaturkaCollection
-from src.db.models.naturka_vagon import NaturkaVagon
 
-from src.schemas.railway import (
-    ReportImport,
-    RangeExtract,
-    SendDeparture,
+def fail(message: str, code: int = 400):
+    raise HTTPException(status_code=code, detail=message)
+
+
+def track(db: Session, track_id: int, kind: RailwayType | None = None) -> Railway:
+    result = db.get(Railway, track_id)
+    if result is None:
+        fail("Railway not found", 404)
+    if kind is not None and result.type != int(kind):
+        fail(f"Railway must be {kind.name}")
+    return result
+
+
+def lock_tracks(db: Session, *track_ids: int | None) -> None:
+    """Use a stable lock order in PostgreSQL for every occupancy-changing operation."""
+    ids = sorted({i for i in track_ids if i is not None})
+    if ids:
+        rows = db.scalars(select(Railway).where(Railway.id.in_(ids)).order_by(Railway.id).with_for_update()).all()
+        if len(rows) != len(ids):
+            fail("Railway not found", 404)
+
+
+def load_collection(db: Session, collection_id: int) -> NaturkaCollection:
+    c = db.scalar(select(NaturkaCollection).where(NaturkaCollection.id == collection_id)
+                  .options(selectinload(NaturkaCollection.vagons)).execution_options(populate_existing=True))
+    if c is None:
+        fail("Collection not found", 404)
+    return c
+
+
+def occupied_length(db: Session, railway_id: int) -> int:
+    return int(db.scalar(select(func.coalesce(func.sum(NaturkaCollection.length), 0)).where(
+        NaturkaCollection.railway_id == railway_id,
+        NaturkaCollection.hidden.is_(False),
+        NaturkaCollection.status.in_(("entrance", "sorting", "departure")),
+    )) or 0)
+
+
+def ensure_space(db: Session, railway: Railway, additional: int) -> None:
+    if railway.length is None:
+        fail("Direct railway cannot hold a collection")
+    if occupied_length(db, railway.id) + additional > railway.length:
+        fail(f"Insufficient space on {railway.code}: need {additional} m", 409)
+
+
+def allocate_message_id(db: Session, station_id: int) -> int:
+    """Allocate a reusable 1..999 message ID within a single station.
+
+    PostgreSQL serializes same-station allocations via the counter row.
+    Seed a counter when creating the station (in the same transaction).
+    """
+    counter = db.scalar(select(MessageIdCounter).where(
+        MessageIdCounter.station_id == station_id
+    ).with_for_update())
+    if counter is None:
+        fail("Station message ID counter is missing; create it through station setup", 500)
+    active = set(db.scalars(select(NaturkaCollection.message_id).where(
+        NaturkaCollection.station_id == station_id,
+        NaturkaCollection.message_id.is_not(None),
+        NaturkaCollection.hidden.is_(False),
+        NaturkaCollection.status.in_(("entrance", "departure")),
+    )).all())
+    for _ in range(999):
+        candidate = (counter.last_assigned % 999) + 1
+        counter.last_assigned = candidate
+        if candidate not in active:
+            db.flush()
+            return candidate
+    fail("All 999 active message IDs at this station are allocated", 409)
+
+
+def require_same_station(source_station_id: int, railway: Railway) -> None:
+    if source_station_id != railway.station_id:
+        fail("Cross-station wagon movement is not supported", 409)
+
+
+def sorting_batch(db: Session, railway_id: int) -> NaturkaCollection | None:
+    batches = db.scalars(select(NaturkaCollection).where(
+        NaturkaCollection.railway_id == railway_id,
+        NaturkaCollection.status == "sorting",
+    ).with_for_update()).all()
+    if len(batches) > 1:
+        fail("Multiple sorting collections exist; clean up old data", 409)
+    return batches[0] if batches else None
+
+
+def create_sorting_batch(db: Session, railway_id: int, source_id: int) -> NaturkaCollection:
+    source = load_collection(db, source_id)
+    batch = NaturkaCollection(
+        station_id=source.station_id,
+        railway_id=railway_id, source_collection_id=source_id,
+        length=0, weight=0, received=True, ready=False,
+        hidden=False, status="sorting", target_station=None,
+    )
+    db.add(batch)
+    db.flush()
+    return batch
+
+
+WAGON_COPY_FIELDS = (
+    "vagon_number", "vagon_country", "product_weight", "product_type", "punkt",
+    "target_station", "vagon_condition", "product_importance", "ban",
+    "count_plomba", "count_container", "through_station", "extra_data", "length_m",
 )
 
 
-def fail(message: str, status: int = 400):
-    raise HTTPException(
-        status_code=status,
-        detail=message,
+def recalc(batch: NaturkaCollection, wagons: list[NaturkaVagon]) -> None:
+    batch.length = sum(w.length_m for w in wagons)
+    batch.weight = sum(w.product_weight for w in wagons)
+
+
+def import_report(db: Session, request: ReportImport) -> NaturkaCollection:
+    lock_tracks(db, request.entrance_id)
+    entrance = track(db, request.entrance_id, RailwayType.ENTRANCE)
+    # Incoming report length/weight are authoritative. Do NOT calculate/overwrite them.
+    ensure_space(db, entrance, request.header.length)
+    # Entrance message_id is supplied by user, never allocated here.
+    incoming_id = request.header.message_id
+    active_id = db.scalar(select(NaturkaCollection.id).where(
+        NaturkaCollection.station_id == entrance.station_id,
+        NaturkaCollection.message_id == incoming_id,
+        NaturkaCollection.hidden.is_(False),
+        NaturkaCollection.status.in_(("entrance", "departure")),
+    ))
+    if active_id is not None:
+        fail("This message_id is already active at this station", 409)
+    batch = NaturkaCollection(
+        **request.header.model_dump(),
+        station_id=entrance.station_id,
+        railway_id=entrance.id, status="entrance", hidden=False,
+        received=True, ready=False,
     )
-
-
-def get_track(
-    db: Session,
-    railway_id: int,
-    expected_type: RailwayType | None = None,
-    lock: bool = False,
-) -> Railway:
-    query = select(Railway).where(
-        Railway.id == railway_id
-    )
-
-    if lock:
-        query = query.with_for_update()
-
-    railway = db.scalar(query)
-
-    if railway is None:
-        fail("Railway not found", 404)
-
-    if (
-        expected_type is not None
-        and railway.type != int(expected_type)
-    ):
-        fail(
-            f"Railway must be type {expected_type.name}"
-        )
-
-    return railway
-
-
-def occupied_length(
-    db: Session,
-    railway_id: int,
-) -> int:
-    query = select(
-        func.coalesce(
-            func.sum(NaturkaCollection.length),
-            0,
-        )
-    ).where(
-        NaturkaCollection.railway_id == railway_id
-    )
-
-    return int(db.scalar(query) or 0)
-
-
-def ensure_capacity(
-    db: Session,
-    railway: Railway,
-    additional_length: int,
-):
-    if railway.length is None:
-        fail("A track without length cannot hold collections")
-
-    used = occupied_length(db, railway.id)
-
-    if used + additional_length > railway.length:
-        fail(
-            f"Insufficient capacity on {railway.code}. "
-            f"Capacity: {railway.length} m, "
-            f"occupied: {used} m, "
-            f"additional: {additional_length} m"
-        )
-
-
-def load_collection(
-    db: Session,
-    collection_id: int,
-    lock: bool = False,
-) -> NaturkaCollection:
-    query = select(NaturkaCollection).where(
-        NaturkaCollection.id == collection_id
-    )
-
-    if lock:
-        query = query.with_for_update()
-
-    collection = db.scalar(query)
-
-    if collection is None:
-        fail("Collection not found", 404)
-
-    db.refresh(collection, ["vagons"])
-
-    collection.vagons.sort(
-        key=lambda wagon: wagon.position
-    )
-
-    return collection
-
-
-def select_sorting_railway(
-    db: Session,
-    length_m: int,
-) -> Railway:
-    railway_ids = db.scalars(
-        select(Railway.id)
-        .where(Railway.type == RailwayType.SORTING)
-        .order_by(Railway.code, Railway.id)
-    ).all()
-
-    for railway_id in railway_ids:
-        railway = get_track(
-            db,
-            railway_id,
-            RailwayType.SORTING,
-            lock=True,
-        )
-
-        free_space = railway.length - occupied_length(
-            db, railway.id
-        )
-
-        if free_space >= length_m:
-            return railway
-
-    fail("No sorting railway has enough free space")
-
-
-def clone_collection(
-    source: NaturkaCollection,
-    railway_id: int,
-) -> NaturkaCollection:
-    return NaturkaCollection(
-        sent_station=source.sent_station,
-        train_number=source.train_number,
-        assigned_id=source.assigned_id,
-        train_condition=source.train_condition,
-
-        length=0,
-        weight=0,
-
-        tosish=None,
-        tepa=None,
-        yon=None,
-        past=None,
-        animal=None,
-
-        extra=None,
-        extra2=None,
-        received=None,
-
-        railway_id=railway_id,
-        target_station=None,
-
-        status="sorting",
-        ready=False,
-    )
-
-
-def import_report(
-    db: Session,
-    data: ReportImport,
-) -> NaturkaCollection:
-    entrance = get_track(
-        db,
-        data.entrance_id,
-        RailwayType.ENTRANCE,
-        lock=True,
-    )
-
-    total_length = sum(
-        wagon.length_m for wagon in data.vagons
-    )
-
-    total_weight = sum(
-        wagon.product_weight for wagon in data.vagons
-    )
-
-    if (
-        data.reported_length is not None
-        and data.reported_length != total_length
-    ):
-        fail(
-            "Reported length differs from total wagon length"
-        )
-
-    # Validate incoming formation against entrance capacity.
-    ensure_capacity(db, entrance, total_length)
-
-    if data.sorting_id is not None:
-        sorting = get_track(
-            db,
-            data.sorting_id,
-            RailwayType.SORTING,
-            lock=True,
-        )
-
-        ensure_capacity(db, sorting, total_length)
-
-    else:
-        sorting = select_sorting_railway(
-            db, total_length
-        )
-
-    collection = NaturkaCollection(
-        sent_station=data.header.sent_station,
-        train_number=data.header.train_number,
-        assigned_id=data.header.assigned_id,
-        train_condition=data.header.train_condition,
-
-        length=total_length,
-        weight=total_weight,
-
-        tosish=None,
-        tepa=None,
-        yon=None,
-        past=None,
-        animal=None,
-
-        extra=None,
-        extra2=None,
-        received=None,
-
-        railway_id=sorting.id,
-        target_station=None,
-
-        status="sorting",
-        ready=False,
-    )
-
-    db.add(collection)
+    db.add(batch)
     db.flush()
-
-    for position, wagon_data in enumerate(
-        data.vagons,
-        start=1,
-    ):
-        wagon = NaturkaVagon(
-            **wagon_data.model_dump(),
-            collection_id=collection.id,
-            position=position,
-        )
-
-        db.add(wagon)
-
+    for i, wagon in enumerate(request.vagons, start=1):
+        db.add(NaturkaVagon(**wagon.model_dump(), station_id=entrance.station_id, collection_id=batch.id, position=i))
     db.flush()
+    return load_collection(db, batch.id)
 
-    return load_collection(db, collection.id)
 
-
-def extract_range(
-    db: Session,
-    data: RangeExtract,
-) -> NaturkaCollection:
-    if data.start_position > data.end_position:
-        fail("start_position cannot exceed end_position")
-
-    source = load_collection(
-        db,
-        data.source_collection_id,
-        lock=True,
-    )
-
-    if source.status != "sorting":
-        fail("Only sorting collections can be modified")
-
-    if source.railway_id is None:
-        fail("Source collection has no railway")
-
-    get_track(
-        db,
-        source.railway_id,
-        RailwayType.SORTING,
-        lock=True,
-    )
-
-    destination_track = get_track(
-        db,
-        data.destination_sorting_id,
-        RailwayType.SORTING,
-        lock=True,
-    )
-
-    source_vagons = sorted(
-        source.vagons,
-        key=lambda wagon: wagon.position,
-    )
-
-    if data.end_position > len(source_vagons):
-        fail("Selected range exceeds collection length")
-
-    selected = source_vagons[
-        data.start_position - 1:data.end_position
-    ]
-
-    remaining = [
-        wagon for wagon in source_vagons
-        if wagon not in selected
-    ]
-
-    moved_length = sum(
-        wagon.length_m for wagon in selected
-    )
-
-    if data.destination_collection_id is not None:
-        destination = load_collection(
-            db,
-            data.destination_collection_id,
-            lock=True,
-        )
-
-        if destination.id == source.id:
-            fail("Source and destination must differ")
-
-        if destination.status != "sorting":
-            fail("Destination collection is not sorting")
-
-        if destination.railway_id != destination_track.id:
-            fail("Destination collection is on another track")
-
-        destination_vagons = sorted(
-            destination.vagons,
-            key=lambda wagon: wagon.position,
-        )
-
+def move_to_sorting(db: Session, request: MoveToSorting) -> NaturkaCollection:
+    original = load_collection(db, request.collection_id)
+    if original.status != "entrance" or original.hidden or original.railway_id is None:
+        fail("Source must be a visible entrance collection")
+    lock_tracks(db, original.railway_id, request.sorting_railway_id)
+    track(db, original.railway_id, RailwayType.ENTRANCE)
+    target = track(db, request.sorting_railway_id, RailwayType.SORTING)
+    require_same_station(original.station_id, target)
+    # The row lock below serializes movements from the SAME original.
+    db.scalar(select(NaturkaCollection).where(NaturkaCollection.id == original.id).with_for_update())
+    original = load_collection(db, original.id)
+    wagons = sorted(original.vagons, key=lambda w: w.position)
+    if request.start_position is None:
+        chosen = wagons
     else:
-        destination = clone_collection(
-            source,
-            destination_track.id,
-        )
+        chosen = [w for w in wagons if request.start_position <= w.position <= request.end_position]
+        if len(chosen) != request.end_position - request.start_position + 1:
+            fail("Requested range contains missing positions")
+    if not chosen:
+        fail("No wagons selected")
+    # Global source_vagon_id uniqueness prevents assigning the same original twice.
+    selected_ids = [w.id for w in chosen]
+    previously_copied = set(db.scalars(select(NaturkaVagon.source_vagon_id).where(
+        NaturkaVagon.source_vagon_id.in_(selected_ids)
+    )).all())
+    chosen = [w for w in chosen if w.id not in previously_copied] if request.start_position is None else chosen
+    if request.start_position is not None and any(w.id in previously_copied for w in chosen):
+        fail("Selected wagon has already been assigned to sorting", 409)
+    if not chosen:
+        fail("All wagons from this entrance collection are already assigned", 409)
+    additional = sum(w.length_m for w in chosen)
+    ensure_space(db, target, additional)
+    batch = sorting_batch(db, target.id)
+    if batch is None:
+        batch = create_sorting_batch(db, target.id, original.id)
+    existing = list(db.scalars(select(NaturkaVagon).where(
+        NaturkaVagon.collection_id == batch.id).order_by(NaturkaVagon.position)).all())
+    for pos, original_wagon in enumerate(chosen, start=len(existing) + 1):
+        copied = NaturkaVagon(**{name: getattr(original_wagon, name) for name in WAGON_COPY_FIELDS},
+                             station_id=original.station_id,
+                             collection_id=batch.id, source_vagon_id=original_wagon.id, position=pos)
+        db.add(copied)
+    db.flush()
+    new_wagons = list(db.scalars(select(NaturkaVagon).where(NaturkaVagon.collection_id == batch.id)).all())
+    recalc(batch, new_wagons)
+    db.flush()
+    copied_ids = set(db.scalars(select(NaturkaVagon.source_vagon_id).where(
+        NaturkaVagon.source_vagon_id.in_([w.id for w in wagons])
+    )).all())
+    if all(w.id in copied_ids for w in wagons):
+        original.hidden = True
+        original.status = "original"
+        original.railway_id = None
+    db.flush()
+    return load_collection(db, batch.id)
 
-        db.add(destination)
-        db.flush()
 
-        destination_vagons = []
-
-    if source.railway_id != destination_track.id:
-        ensure_capacity(
-            db,
-            destination_track,
-            moved_length,
-        )
-
-    # Move positions temporarily outside the positive range.
-    # This avoids collisions with the unique constraint.
-    for wagon in source_vagons + destination_vagons:
+def extract_range(db: Session, request: RangeExtract) -> NaturkaCollection:
+    if request.start_position > request.end_position:
+        fail("Invalid position range")
+    source = load_collection(db, request.source_collection_id)
+    if source.status != "sorting" or source.railway_id is None:
+        fail("Source must be an active sorting collection")
+    if source.railway_id == request.destination_sorting_id:
+        fail("Choose a different sorting railway")
+    lock_tracks(db, source.railway_id, request.destination_sorting_id)
+    target = track(db, request.destination_sorting_id, RailwayType.SORTING)
+    require_same_station(source.station_id, target)
+    source = load_collection(db, source.id)
+    wagons = sorted(source.vagons, key=lambda w: w.position)
+    if request.end_position > len(wagons):
+        fail("Range exceeds wagon count")
+    moved = wagons[request.start_position - 1:request.end_position]
+    remaining = wagons[:request.start_position - 1] + wagons[request.end_position:]
+    ensure_space(db, target, sum(w.length_m for w in moved))
+    dest = sorting_batch(db, target.id)
+    if dest is None:
+        if request.destination_collection_id is not None:
+            fail("Requested destination batch does not exist", 409)
+        dest = create_sorting_batch(db, target.id, source.source_collection_id or source.id)
+    elif request.destination_collection_id not in (None, dest.id):
+        fail("Destination track has a different active batch", 409)
+    existing = list(db.scalars(select(NaturkaVagon).where(
+        NaturkaVagon.collection_id == dest.id).order_by(NaturkaVagon.position)).all())
+    for wagon in wagons + existing:
         wagon.position = -wagon.id
-
     db.flush()
-
-    # Transfer the chosen wagons directly.
-    # No entrance-track movement is created.
-    for wagon in selected:
-        wagon.collection_id = destination.id
-
+    for wagon in moved:
+        wagon.collection_id = dest.id
     db.flush()
+    for i, wagon in enumerate(remaining, start=1):
+        wagon.position = i
+    for i, wagon in enumerate(existing + moved, start=1):
+        wagon.position = i
+    recalc(dest, existing + moved)
+    if remaining:
+        recalc(source, remaining)
+    else:
+        # Persist reassignment before deleting the old parent.
+        # Otherwise a loaded source.vagons relationship may null out moved FKs.
+        db.flush()
+        db.expire(source, ["vagons"])
+        db.delete(source)
+    db.flush()
+    return load_collection(db, dest.id)
 
-    # Rebuild source order.
-    for position, wagon in enumerate(
-        remaining,
-        start=1,
-    ):
+
+def send_departure(db: Session, request: SendDeparture) -> NaturkaCollection:
+    batch = load_collection(db, request.collection_id)
+    if batch.status != "sorting" or batch.railway_id is None or not batch.vagons:
+        fail("Only a nonempty sorting batch can move to departure")
+    lock_tracks(db, batch.railway_id, request.departure_railway_id)
+    track(db, batch.railway_id, RailwayType.SORTING)
+    departure = track(db, request.departure_railway_id, RailwayType.DEPARTURE)
+    require_same_station(batch.station_id, departure)
+    ensure_space(db, departure, batch.length)
+    batch.message_id = allocate_message_id(db, batch.station_id)
+    for field in ("message_station", "train_number", "sent_station", "target_station", "train_condition",
+                  "tosish", "tepa", "yon", "past", "animal", "extra", "extra2"):
+        setattr(batch, field, getattr(request, field))
+    batch.railway_id = departure.id
+    batch.status = "departure"
+    batch.ready = False  # Never automatic
+    db.flush()
+    return load_collection(db, batch.id)
+
+
+def set_readiness(db: Session, collection_id: int, ready: bool) -> NaturkaCollection:
+    batch = load_collection(db, collection_id)
+    if batch.status != "departure" or batch.railway_id is None:
+        fail("Only departure collections can be marked ready")
+    lock_tracks(db, batch.railway_id)
+    batch.ready = ready
+    db.flush()
+    return load_collection(db, batch.id)
+
+
+def dispatch(db: Session, collection_id: int) -> NaturkaCollection:
+    batch = load_collection(db, collection_id)
+    if batch.status != "departure" or not batch.ready or batch.railway_id is None:
+        fail("Collection is not ready for dispatch")
+    lock_tracks(db, batch.railway_id)
+    batch.railway_id = None
+    batch.status = "sent"
+    db.flush()
+    return load_collection(db, batch.id)
+
+
+# --- Wagon ordering and insertion ---
+def editable_batch(db: Session, collection_id: int) -> NaturkaCollection:
+    batch = load_collection(db, collection_id)
+    if batch.status not in ("sorting", "departure") or batch.railway_id is None:
+        fail("Wagons can only be edited on sorting or departure tracks")
+    lock_tracks(db, batch.railway_id)
+    # Avoid race with readiness and dispatch changes.
+    db.scalar(select(NaturkaCollection).where(
+        NaturkaCollection.id == collection_id
+    ).with_for_update())
+    batch = load_collection(db, collection_id)
+    if batch.status == "departure" and batch.ready:
+        fail("Unmark the collection as ready before editing its wagons", 409)
+    return batch
+
+
+def save_wagon_order(db: Session, ordered: list[NaturkaVagon]) -> None:
+    """Two-phase update avoids (collection_id, position) UNIQUE collisions."""
+    for wagon in ordered:
+        wagon.position = -wagon.id
+    db.flush()
+    for position, wagon in enumerate(ordered, 1):
         wagon.position = position
+    db.flush()
 
-    # Append selected range to destination.
-    combined = destination_vagons + selected
 
-    for position, wagon in enumerate(
-        combined,
-        start=1,
-    ):
+def reorder_wagons(db: Session, collection_id: int, request: ReorderWagons) -> NaturkaCollection:
+    batch = editable_batch(db, collection_id)
+    existing = sorted(batch.vagons, key=lambda w: w.position)
+    actual_ids = [w.id for w in existing]
+    if len(request.wagon_ids) != len(actual_ids) or set(request.wagon_ids) != set(actual_ids):
+        fail("wagon_ids must contain each wagon in this collection exactly once")
+    by_id = {w.id: w for w in existing}
+    save_wagon_order(db, [by_id[i] for i in request.wagon_ids])
+    return load_collection(db, collection_id)
+
+
+def move_wagon_position(db: Session, collection_id: int, request: MoveWagonPosition) -> NaturkaCollection:
+    batch = editable_batch(db, collection_id)
+    ordered = sorted(batch.vagons, key=lambda w: w.position)
+    if not 1 <= request.new_position <= len(ordered):
+        fail("new_position out of range")
+    wagon = next((w for w in ordered if w.id == request.wagon_id), None)
+    if wagon is None:
+        fail("Wagon does not belong to this collection", 404)
+    ordered.remove(wagon)
+    ordered.insert(request.new_position - 1, wagon)
+    save_wagon_order(db, ordered)
+    return load_collection(db, collection_id)
+
+
+def insert_existing_wagons(db: Session, destination_collection_id: int, request: InsertExistingWagons) -> NaturkaCollection:
+    """Move an existing contiguous wagon range into a specified position.
+
+    Sorting -> sorting and non-ready departure <-> sorting/departure are allowed.
+    No new wagon rows are created. A whole-source departure batch cannot vanish
+    silently: empty departure batches are rejected, but empty sorting batches are deleted.
+    """
+    if request.source_collection_id == destination_collection_id:
+        fail("Use /wagons/move or /wagons/order for the same collection")
+    if request.start_position > request.end_position:
+        fail("Invalid wagon range")
+    src = load_collection(db, request.source_collection_id)
+    dst = load_collection(db, destination_collection_id)
+    if src.station_id != dst.station_id:
+        fail("Cross-station transfer forbidden", 403)
+    if src.railway_id is None or dst.railway_id is None:
+        fail("Both collections must occupy a railway")
+    lock_tracks(db, src.railway_id, dst.railway_id)
+    # Lock collection rows in deterministic order as well.
+    db.scalars(select(NaturkaCollection).where(NaturkaCollection.id.in_(sorted((src.id, dst.id))))
+               .order_by(NaturkaCollection.id).with_for_update()).all()
+    src = load_collection(db, src.id)
+    dst = load_collection(db, dst.id)
+    for c in (src, dst):
+        if c.status not in ("sorting", "departure") or (c.status == "departure" and c.ready):
+            fail("Only sorting and not-ready departure collections can be edited", 409)
+        t = track(db, c.railway_id)
+        require_same_station(c.station_id, t)
+    source_order = sorted(src.vagons, key=lambda w: w.position)
+    dest_order = sorted(dst.vagons, key=lambda w: w.position)
+    if request.end_position > len(source_order):
+        fail("Selected range exceeds source wagon count")
+    if not 1 <= request.destination_position <= len(dest_order) + 1:
+        fail("Invalid destination position")
+    moving = source_order[request.start_position - 1:request.end_position]
+    keep = source_order[:request.start_position - 1] + source_order[request.end_position:]
+    if not keep and src.status == "departure":
+        fail("Cannot empty a departure collection; change its status through the departure workflow", 409)
+    moved_len = sum(w.length_m for w in moving)
+    if src.railway_id != dst.railway_id:
+        ensure_space(db, track(db, dst.railway_id), moved_len)
+    # A sorting track has one collection; destination selection must not create two.
+    new_dest = dest_order[:request.destination_position - 1] + moving + dest_order[request.destination_position - 1:]
+    for w in source_order + dest_order:
+        w.position = -w.id
+    db.flush()
+    for w in moving:
+        w.collection_id = dst.id
+    db.flush()
+    for position, wagon in enumerate(keep, 1):
         wagon.position = position
-
-    source.length = sum(
-        wagon.length_m for wagon in remaining
-    )
-
-    source.weight = sum(
-        wagon.product_weight for wagon in remaining
-    )
-
-    destination.length = sum(
-        wagon.length_m for wagon in combined
-    )
-
-    destination.weight = sum(
-        wagon.product_weight for wagon in combined
-    )
-
+    for position, wagon in enumerate(new_dest, 1):
+        wagon.position = position
+    recalc(dst, new_dest)
+    if keep:
+        recalc(src, keep)
+    else:
+        db.flush()
+        db.expire(src, ["vagons"])
+        db.delete(src)
     db.flush()
-
-    return load_collection(db, destination.id)
-
-
-def send_departure(
-    db: Session,
-    data: SendDeparture,
-) -> NaturkaCollection:
-    collection = load_collection(
-        db,
-        data.collection_id,
-        lock=True,
-    )
-
-    if collection.status != "sorting":
-        fail("Collection is not in sorting status")
-
-    if collection.railway_id is None:
-        fail("Collection has no sorting railway")
-
-    get_track(
-        db,
-        collection.railway_id,
-        RailwayType.SORTING,
-        lock=True,
-    )
-
-    if not collection.vagons:
-        fail("Cannot move an empty collection")
-
-    departure = get_track(
-        db,
-        data.departure_railway_id,
-        RailwayType.DEPARTURE,
-        lock=True,
-    )
-
-    ensure_capacity(
-        db,
-        departure,
-        collection.length,
-    )
-
-    collection.railway_id = departure.id
-    collection.target_station = departure.id
-
-    collection.tosish = data.tosish
-    collection.tepa = data.tepa
-    collection.yon = data.yon
-    collection.past = data.past
-    collection.animal = data.animal
-
-    collection.extra = data.extra
-    collection.extra2 = data.extra2
-    collection.received = data.received
-
-    # Moving to departure does NOT mark it ready.
-    collection.status = "departure"
-    collection.ready = False
-
-    db.flush()
-
-    return load_collection(db, collection.id)
-
-
-def set_readiness(
-    db: Session,
-    collection_id: int,
-    ready: bool,
-) -> NaturkaCollection:
-    collection = load_collection(
-        db,
-        collection_id,
-        lock=True,
-    )
-
-    if collection.status != "departure":
-        fail(
-            "Readiness can only be changed "
-            "on a departure railway"
-        )
-
-    if collection.railway_id is None:
-        fail("Collection has no departure railway")
-
-    get_track(
-        db,
-        collection.railway_id,
-        RailwayType.DEPARTURE,
-        lock=True,
-    )
-
-    # Explicit user decision.
-    collection.ready = ready
-
-    db.flush()
-
-    return load_collection(db, collection.id)
-
-
-def dispatch_collection(
-    db: Session,
-    collection_id: int,
-) -> NaturkaCollection:
-    collection = load_collection(
-        db,
-        collection_id,
-        lock=True,
-    )
-
-    if collection.status != "departure":
-        fail("Collection is not on a departure railway")
-
-    if not collection.ready:
-        fail("Collection has not been marked ready")
-
-    if collection.railway_id is None:
-        fail("Collection has no departure railway")
-
-    get_track(
-        db,
-        collection.railway_id,
-        RailwayType.DEPARTURE,
-        lock=True,
-    )
-
-    # Free occupied railway capacity.
-    collection.railway_id = None
-    collection.status = "sent"
-
-    # Keep ready and target_station for history.
-    # Keep all wagons and collection information.
-    db.flush()
-
-    return load_collection(db, collection.id)
+    return load_collection(db, dst.id)
