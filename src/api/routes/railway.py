@@ -10,6 +10,7 @@ from src.schemas.railway import (
     ReorderWagons, MoveWagonPosition, InsertExistingWagons,
 )
 from src.services import railway_operations as service
+from src.services.railway_order import place_railway
 from src.db.models.user import User
 from src.api.deps.auth import current_user, superuser_only, require_station
 
@@ -82,9 +83,13 @@ def create_railway(data: RailwayCreate, db: Session = Depends(get_db), user: Use
     require_station(user, data.station_id)
     if db.get(Station, data.station_id) is None:
         raise HTTPException(404, "Station not found")
-    railway = Railway(**data.model_dump())
+    fields = data.model_dump()
+    position = fields.pop("position")
+    railway = Railway(**fields)
     db.add(railway)
     try:
+        db.flush()
+        place_railway(db, railway, position)  # на указанное место (остальные сдвигаются) или в конец
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -101,7 +106,8 @@ def list_railways(station_id: int | None = None, db: Session = Depends(get_db), 
         stmt = stmt.where(Railway.station_id == station_id)
     elif not user.is_superuser:
         stmt = stmt.where(Railway.station_id == user.station_id)
-    return db.scalars(stmt.order_by(Railway.station_id, Railway.type, Railway.code)).all()
+    return db.scalars(stmt.order_by(Railway.station_id, Railway.position.is_(None), Railway.position,
+                                    Railway.type, Railway.code)).all()
 
 
 @router.get("/originals", response_model=list[CollectionView])
@@ -133,6 +139,7 @@ def get_railway(railway_id: int, db: Session = Depends(get_db), user: User = Dep
     used = service.occupied_length(db, railway_id)
     return {
         "id": railway.id, "station_id": railway.station_id, "code": railway.code, "type": railway.type,
+        "position": railway.position,
         "length": railway.length, "occupied_length": used,
         "available_length": None if railway.length is None else railway.length - used,
         "collections": [{

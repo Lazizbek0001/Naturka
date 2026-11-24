@@ -17,6 +17,10 @@ class Station(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     code: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Название на других языках интерфейса (рус. — в name). ÖZ получается из name_uz.
+    name_uz: Mapped[str | None] = mapped_column(String(255))
+    name_uzc: Mapped[str | None] = mapped_column(String(255))
+    name_en: Mapped[str | None] = mapped_column(String(255))
 
     users: Mapped[list["User"]] = relationship("User", back_populates="station")
     railways: Mapped[list["Railway"]] = relationship("Railway", back_populates="station")

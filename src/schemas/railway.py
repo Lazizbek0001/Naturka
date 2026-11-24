@@ -4,6 +4,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 class StationCreate(BaseModel):
     code: str = Field(min_length=1, max_length=50)
     name: str = Field(min_length=1, max_length=255)
+    name_uz: str | None = Field(default=None, max_length=255)
+    name_uzc: str | None = Field(default=None, max_length=255)
+    name_en: str | None = Field(default=None, max_length=255)
 
 class StationView(StationCreate):
     model_config = ConfigDict(from_attributes=True)
@@ -14,6 +17,7 @@ class RailwayCreate(BaseModel):
     code: str = Field(min_length=1, max_length=255)
     type: int = Field(ge=1, le=4)
     length: int | None = None
+    position: int | None = Field(default=None, ge=1)  # место в списке путей станции; пусто — в конец
 
 class RailwayView(RailwayCreate):
     model_config = ConfigDict(from_attributes=True)
@@ -34,6 +38,7 @@ class WagonImport(BaseModel):
     through_station: int
     extra_data: str | None = None
     length_m: int = Field(gt=0)
+    vagon_type: str | None = Field(default=None, max_length=16)
 
 class EntranceHeader(BaseModel):
     message_station: int
@@ -124,6 +129,7 @@ class WagonView(BaseModel):
     count_container: str
     through_station: int
     extra_data: str | None
+    vagon_type: str | None = None
 
 
 class CollectionView(BaseModel):

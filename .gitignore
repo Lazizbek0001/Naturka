@@ -4,3 +4,6 @@ pycache/
 .env
 __pycache__/
 *.db
+# фронтенд — отдельный репозиторий Naturka_Frond; служебные PDF и копии базы не публикуются
+frontend/
+pdf/

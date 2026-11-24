@@ -35,6 +35,8 @@ class NaturkaVagon(Base):
 
     through_station: Mapped[int] = mapped_column(Integer, nullable=False)
     extra_data: Mapped[str | None] = mapped_column(String(255))
+    # Тип вагона, распознанный по натурке или заданный вручную; пусто — определяется по номеру.
+    vagon_type: Mapped[str | None] = mapped_column(String(16))
 
 
     collection_id: Mapped[int | None] = mapped_column(ForeignKey("naturka_collection.id", ondelete="CASCADE"), index=True)

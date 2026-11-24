@@ -30,5 +30,7 @@ class Railway(Base):
     station: Mapped["Station"] = relationship("Station", back_populates="railways")
     length: Mapped[int | None] = mapped_column(Integer, nullable=True)
     type: Mapped[int] = mapped_column(Integer, nullable=False)
+    # порядок пути внутри станции (1, 2, 3…): в списках, парке путей, справочниках
+    position: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     collections: Mapped[list["NaturkaCollection"]] = relationship(
         "NaturkaCollection", foreign_keys="NaturkaCollection.railway_id", back_populates="railway")

@@ -60,3 +60,49 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db), _: User = De
         raise HTTPException(409, "Username already exists") from exc
     db.refresh(user)
     return user
+
+class UserUpdate(BaseModel):
+    username: str | None = Field(default=None, min_length=3, max_length=100)
+    password: str | None = Field(default=None, min_length=10, max_length=256)
+    station_id: int | None = None
+    is_superuser: bool | None = None
+    is_active: bool | None = None
+
+@router.patch("/users/{user_id}", response_model=UserView)
+def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db), me_: User = Depends(superuser_only)):
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(404, "User not found")
+    fields = payload.model_dump(exclude_unset=True)
+    if user.id == me_.id and (fields.get("is_superuser") is False or fields.get("is_active") is False):
+        raise HTTPException(400, "You cannot remove your own superuser rights or deactivate yourself")
+    if "station_id" in fields and fields["station_id"] is not None and db.get(Station, fields["station_id"]) is None:
+        raise HTTPException(404, "Station not found")
+    if fields.get("username"):
+        user.username = fields["username"]
+    if fields.get("password"):
+        user.password_hash = hash_password(fields["password"])
+    if "station_id" in fields:
+        user.station_id = fields["station_id"]
+    for key in ("is_superuser", "is_active"):
+        if fields.get(key) is not None:
+            setattr(user, key, fields[key])
+    if not user.is_superuser and user.station_id is None:
+        raise HTTPException(400, "A normal user must be assigned to a station")
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "Username already exists") from exc
+    db.refresh(user)
+    return user
+
+@router.delete("/users/{user_id}", status_code=204)
+def delete_user(user_id: int, db: Session = Depends(get_db), me_: User = Depends(superuser_only)):
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(404, "User not found")
+    if user.id == me_.id:
+        raise HTTPException(400, "You cannot delete yourself")
+    db.delete(user)
+    db.commit()

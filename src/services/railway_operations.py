@@ -108,7 +108,7 @@ def create_sorting_batch(db: Session, railway_id: int, source_id: int) -> Naturk
 WAGON_COPY_FIELDS = (
     "vagon_number", "vagon_country", "product_weight", "product_type", "punkt",
     "target_station", "vagon_condition", "product_importance", "ban",
-    "count_plomba", "count_container", "through_station", "extra_data", "length_m",
+    "count_plomba", "count_container", "through_station", "extra_data", "length_m", "vagon_type",
 )
 
 
