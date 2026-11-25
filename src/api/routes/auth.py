@@ -20,6 +20,7 @@ class UserCreate(BaseModel):
     station_id: int | None = None
     is_superuser: bool = False
     is_active: bool = True
+    dashboard: bool = False  # доступ к «Главной»
 
 class UserView(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -28,6 +29,7 @@ class UserView(BaseModel):
     station_id: int | None
     is_superuser: bool
     is_active: bool
+    dashboard: bool | None = False
 
 @router.post("/login")
 def login(payload: LoginData, db: Session = Depends(get_db)):
@@ -51,7 +53,8 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db), _: User = De
     if payload.station_id is not None and db.get(Station, payload.station_id) is None:
         raise HTTPException(404, "Station not found")
     user = User(username=payload.username, password_hash=hash_password(payload.password),
-                station_id=payload.station_id, is_superuser=payload.is_superuser, is_active=payload.is_active)
+                station_id=payload.station_id, is_superuser=payload.is_superuser, is_active=payload.is_active,
+                dashboard=payload.dashboard)
     db.add(user)
     try:
         db.commit()
@@ -67,6 +70,7 @@ class UserUpdate(BaseModel):
     station_id: int | None = None
     is_superuser: bool | None = None
     is_active: bool | None = None
+    dashboard: bool | None = None
 
 @router.patch("/users/{user_id}", response_model=UserView)
 def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db), me_: User = Depends(superuser_only)):
@@ -84,7 +88,7 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
         user.password_hash = hash_password(fields["password"])
     if "station_id" in fields:
         user.station_id = fields["station_id"]
-    for key in ("is_superuser", "is_active"):
+    for key in ("is_superuser", "is_active", "dashboard"):
         if fields.get(key) is not None:
             setattr(user, key, fields[key])
     if not user.is_superuser and user.station_id is None:
