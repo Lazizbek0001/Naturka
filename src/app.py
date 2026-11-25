@@ -5,6 +5,7 @@ from src.db.base import Base
 from src.db.session import engine
 import src.db.models  # register all models
 from src.api.routes.railway import router as railway_router
+from src.api.routes.site_settings import router as site_settings_router
 from src.api.routes.auth import router as auth_router
 from src.api.routes.manage import router as manage_router
 from src.api.routes.station_refs import router as refs_router
@@ -53,6 +54,7 @@ app.add_middleware(
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 app.include_router(auth_router)
+app.include_router(site_settings_router)
 app.include_router(manage_router)
 app.include_router(refs_router)
 app.include_router(drawings_router)
