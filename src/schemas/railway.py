@@ -11,6 +11,7 @@ class StationCreate(BaseModel):
 class StationView(StationCreate):
     model_config = ConfigDict(from_attributes=True)
     id: int
+    inactive: bool | None = None
 
 class RailwayCreate(BaseModel):
     station_id: int = Field(gt=0)

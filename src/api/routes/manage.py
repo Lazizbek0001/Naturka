@@ -50,6 +50,7 @@ class StationUpdate(BaseModel):
     name_uz: str | None = Field(default=None, max_length=255)
     name_uzc: str | None = Field(default=None, max_length=255)
     name_en: str | None = Field(default=None, max_length=255)
+    inactive: bool | None = None
 
 
 @router.patch("/stations/{station_id}", response_model=StationView)
@@ -59,7 +60,9 @@ def update_station(station_id: int, data: StationUpdate, db: Session = Depends(g
     if station is None:
         raise HTTPException(404, "Station not found")
     for key, value in data.model_dump(exclude_unset=True).items():
-        if value is not None or key.startswith("name_"):
+        if key == "inactive":
+            station.inactive = True if value else None
+        elif value is not None or key.startswith("name_"):
             setattr(station, key, value or None)
     commit(db, "Station code already exists")
     db.refresh(station)

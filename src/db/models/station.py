@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
-from sqlalchemy import Integer, String
+from sqlalchemy import Boolean, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from src.db.base import Base
 
@@ -21,6 +21,8 @@ class Station(Base):
     name_uz: Mapped[str | None] = mapped_column(String(255))
     name_uzc: Mapped[str | None] = mapped_column(String(255))
     name_en: Mapped[str | None] = mapped_column(String(255))
+    # Нерабочая станция: скрыта из выбора станций, пути/схема/вагоны сохраняются
+    inactive: Mapped[bool | None] = mapped_column(Boolean)
 
     users: Mapped[list["User"]] = relationship("User", back_populates="station")
     railways: Mapped[list["Railway"]] = relationship("Railway", back_populates="station")
