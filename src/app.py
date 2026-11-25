@@ -11,6 +11,7 @@ from src.api.routes.station_refs import router as refs_router
 from src.api.routes.drawings import router as drawings_router
 from src.api.routes.schemes import router as schemes_router, seed_existing
 from src.api.routes.weather import router as weather_router
+from src.api.routes.team_platforms import router as team_platforms_router
 
 def add_missing_columns():
     """create_all не добавляет новые колонки в существующие таблицы — добавляем их сами."""
@@ -58,6 +59,7 @@ app.include_router(drawings_router)
 app.include_router(schemes_router)
 app.include_router(railway_router)
 app.include_router(weather_router)
+app.include_router(team_platforms_router)
 
 @app.get("/health")
 def health():

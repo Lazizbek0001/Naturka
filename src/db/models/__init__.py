@@ -8,3 +8,4 @@ from src.db.models.user import User
 from src.db.models.station_ref import StationRef
 from src.db.models.station_drawing import StationDrawing
 from src.db.models.station_scheme import StationScheme
+from src.db.models.site_doc import SiteDoc
