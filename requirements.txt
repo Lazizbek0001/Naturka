@@ -1,0 +1,20 @@
+# Web framework / server
+fastapi==0.162.4
+uvicorn==0.54.0
+
+# Settings & validation
+pydantic==2.14.3
+pydantic-settings==2.16.2
+python-dotenv==1.2.4
+
+# Database
+SQLAlchemy==2.1.8
+# PostgreSQL driver (only needed if DATABASE_URL points to PostgreSQL; SQLite works without it)
+psycopg[binary]==3.3.8
+
+# Auth
+PyJWT==2.15.1
+argon2-cffi==25.1.0
+
+# PDF rendering (station drawings)
+pymupdf==2.1
